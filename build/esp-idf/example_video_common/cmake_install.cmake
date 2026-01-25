@@ -1,4 +1,4 @@
-# Install script for directory: C:/Users/j3cam/Documents/simple_video_server/components/example_video_common
+# Install script for directory: C:/Users/j3cam/Documents/DIMECA_TORRETA/components/example_video_common
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

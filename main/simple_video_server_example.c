@@ -29,6 +29,8 @@
 #include "lwip/inet.h"
 #include "lwip/apps/netbiosns.h"
 #include "example_video_common.h"
+#include "turret_control.h"
+
 
 #define EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER CONFIG_EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER
 
@@ -562,6 +564,7 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
                 s_pd_w = video->width;
                 s_pd_h = video->height;
                 s_pd_fmt = video->pixel_format;
+                turret_set_frame_size(video->width, video->height);
             }
 
             // Si es RGB565 (RGBP), el tamaño real esperado es w*h*2
@@ -1000,6 +1003,45 @@ void app_main(void)
     ESP_ERROR_CHECK(example_video_init());
 
     pd_init();
+        // --- TURRET pins (ajusta si tus GPIO son otros) ---
+    turret_pins_t pins = {
+        .step_gpio = 28,
+        .dir_gpio = 29,
+        .en_gpio = -1, // si tienes ENABLE, pon el GPIO aquí
+
+        .m0_gpio = -1,
+        .m1_gpio = -1,
+        .m2_gpio = -1,
+
+        .servo_gpio = 30,
+
+        // ✅ finales de carrera (un terminal al GPIO, el otro a GND)
+        .limit_left_gpio = 7,
+        .limit_right_gpio = 48};
+
+    // --- Config (ya calibrado para 1/16 microsteps + tu velocidad 500us) ---
+    turret_cfg_t cfg = {
+        .step_delay_us = 500,
+
+        .scan_limit_steps = 6400,
+        .scan_steps_per_tick = 20,
+        .scan_tick_ms = 25,
+
+        .kp_step = 180.0f,
+        .step_min = 4,
+        .step_max = 80,
+
+        .kp_servo = 70.0f,
+        .servo_min_deg = 30,
+        .servo_max_deg = 150,
+        .servo_center_deg = 90,
+
+        .lost_timeout_ms = 700,
+        .valid_age_ms = 350};
+
+    turret_init(&pins, &cfg);
+    turret_start();
+
     // Reserva buffer para copiar 1 frame y correr PD fuera del stream
     s_pd_w = 0;
     s_pd_h = 0;

@@ -1,4 +1,4 @@
-# Install script for directory: C:/Users/j3cam/Documents/simple_video_server/managed_components/espressif__pedestrian_detect
+# Install script for directory: C:/Users/j3cam/Documents/DIMECA_TORRETA/managed_components/espressif__pedestrian_detect
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

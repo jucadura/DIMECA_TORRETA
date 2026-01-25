@@ -219,5 +219,5 @@ const esp_ipa_config_t *esp_ipa_pipeline_get_config(const char *name)
     return NULL;
 }
 
-/* Json file: C:/Users/j3cam/Documents/simple_video_server/managed_components/espressif__esp_cam_sensor/sensors/ov5647/cfg/ov5647_default.json */
+/* Json file: C:/Users/j3cam/Documents/DIMECA_TORRETA/managed_components/espressif__esp_cam_sensor/sensors/ov5647/cfg/ov5647_default.json */
 

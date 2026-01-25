@@ -17,4 +17,4 @@ set confirm off
 set confirm on
 
 # Load application symbols
-file C:/Users/j3cam/Documents/simple_video_server/build/bootloader/bootloader.elf
+file C:/Users/j3cam/Documents/DIMECA_TORRETA/build/bootloader/bootloader.elf

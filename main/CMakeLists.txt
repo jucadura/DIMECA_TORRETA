@@ -1,6 +1,7 @@
 set(srcs
     "simple_video_server_example.c"
     "pd_runner.cpp"
+    "turret_control.c"
 )
 
 set(html_files "../frontend/gzipped/index.html.gz"
@@ -9,6 +10,6 @@ set(html_files "../frontend/gzipped/index.html.gz"
                "../frontend/gzipped/assets/index.js.gz"
                "../frontend/gzipped/assets/index.css.gz")
 
-idf_component_register(SRCS "${srcs}"
+idf_component_register(SRCS ${srcs}
                        PRIV_INCLUDE_DIRS .
                        EMBED_TXTFILES ${html_files})

@@ -39,6 +39,6 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("C:/Users/j3cam/Documents/simple_video_server/build/esp-idf/esp_system/port/soc/esp32p4/cmake_install.cmake")
+  include("C:/Users/j3cam/Documents/DIMECA_TORRETA/build/esp-idf/esp_system/port/soc/esp32p4/cmake_install.cmake")
 endif()
 

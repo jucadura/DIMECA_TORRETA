@@ -3,6 +3,6 @@ source "C:/Users/j3cam/esp/v5.4.3/esp-idf/components/esp_app_format/Kconfig.proj
 source "C:/Users/j3cam/esp/v5.4.3/esp-idf/components/esp_rom/Kconfig.projbuild"
 source "C:/Users/j3cam/esp/v5.4.3/esp-idf/components/esptool_py/Kconfig.projbuild"
 source "C:/Users/j3cam/esp/v5.4.3/esp-idf/components/partition_table/Kconfig.projbuild"
-source "C:/Users/j3cam/Documents/simple_video_server/main/Kconfig.projbuild"
-source "C:/Users/j3cam/Documents/simple_video_server/components/example_video_common/Kconfig.projbuild"
+source "C:/Users/j3cam/Documents/DIMECA_TORRETA/main/Kconfig.projbuild"
+source "C:/Users/j3cam/Documents/DIMECA_TORRETA/components/example_video_common/Kconfig.projbuild"
 source "C:/Users/j3cam/esp/v5.4.3/esp-idf/examples/common_components/protocol_examples_common/Kconfig.projbuild"
