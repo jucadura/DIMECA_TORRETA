@@ -19,6 +19,8 @@ typedef struct {
 
     int limit_left_gpio;      // -1 si no se usa
     int limit_right_gpio;     // -1 si no se usa
+    int mosfet_gpio;   // GPIO para activar MOSFET (ej: 4)
+
 } turret_pins_t;
 
 typedef struct {
@@ -59,3 +61,7 @@ void turret_get_frame_size(int *w, int *h);
 #ifdef __cplusplus
 }
 #endif
+
+void turret_home(void);
+void turret_mosfet_set(bool on);
+void turret_update_target(bool has_target, float nx, float ny);

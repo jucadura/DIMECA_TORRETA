@@ -113,7 +113,8 @@ static void servo_set_deg(int deg)
 
     const int min_us = 500;
     const int max_us = 2500;
-    int pulse_us = min_us + (deg * (max_us - min_us)) / 180;
+    int pulse_us = min_us + (deg * (max_us - min_us)) / 270;
+
 
     uint32_t duty = (uint32_t)((pulse_us * 65535ULL) / 20000ULL);
 
@@ -138,11 +139,21 @@ static bool pick_best_box(const pd_result_t *r, pd_box_t *best)
 
 static void turret_track_from_pd(void)
 {
+    // --- MOSFET anti-parpadeo ---
+static bool mosfet_on = false;
+static int64_t centered_since_ms = 0;
+
     pd_result_t r;
     pd_get_last(&r);
 
     int64_t t = now_ms();
-    if (r.count <= 0) return;
+if (r.count <= 0) {
+    mosfet_on = false;
+    centered_since_ms = 0;
+    turret_mosfet_set(false);
+    return;
+}
+
 
     if (s_cfg.valid_age_ms > 0 && (t - (int64_t)r.ts_ms) > (int64_t)s_cfg.valid_age_ms) {
         return;
@@ -163,6 +174,44 @@ static void turret_track_from_pd(void)
 
     float ex = (0.5f - nx);
     float ey = (0.5f - ny);
+    // ---- MOSFET LOGIC ----
+   // ---- MOSFET LOGIC (histeresis + estabilidad) ----
+float ax = fabsf(ex);
+float ay = fabsf(ey);
+
+// Encender si está MUY centrado
+const float ON_TOL  = 0.02f;  // 2%
+// Apagar si se sale más (histeresis)
+const float OFF_TOL = 0.05f;  // 5%
+
+// Debe mantenerse centrado este tiempo para encender
+const int64_t STABLE_MS = 250;
+
+bool in_on_zone  = (ax < ON_TOL)  && (ay < ON_TOL);
+bool out_off_zone = (ax > OFF_TOL) || (ay > OFF_TOL);
+
+int64_t tnow = now_ms();
+
+if (!mosfet_on) {
+    // aún está apagado → solo encender si se mantiene centrado un rato
+    if (in_on_zone) {
+        if (centered_since_ms == 0) centered_since_ms = tnow;
+        if ((tnow - centered_since_ms) >= STABLE_MS) {
+            mosfet_on = true;
+            turret_mosfet_set(true);
+        }
+    } else {
+        centered_since_ms = 0;
+    }
+} else {
+    // está encendido → solo apagar si se sale bastante
+    if (out_off_zone) {
+        mosfet_on = false;
+        centered_since_ms = 0;
+        turret_mosfet_set(false);
+    }
+}
+
 
     int dir = (ex >= 0) ? -1 : +1;
     float mag = fabsf(ex);
@@ -246,6 +295,14 @@ bool turret_init(const turret_pins_t *pins, const turret_cfg_t *cfg)
     if (s_pins.en_gpio >= 0) {
         gpio_set_level((gpio_num_t)s_pins.en_gpio, 0); // enable activo LOW
     }
+    // --- MOSFET GPIO ---
+if (s_pins.mosfet_gpio >= 0)
+{
+    gpio_reset_pin((gpio_num_t)s_pins.mosfet_gpio);
+    gpio_set_direction((gpio_num_t)s_pins.mosfet_gpio, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)s_pins.mosfet_gpio, 0); // OFF por defecto
+    gpio_set_drive_capability((gpio_num_t)s_pins.mosfet_gpio, GPIO_DRIVE_CAP_3);
+}
 
     if (s_pins.m0_gpio >= 0) gpio_set_direction((gpio_num_t)s_pins.m0_gpio, GPIO_MODE_OUTPUT);
     if (s_pins.m1_gpio >= 0) gpio_set_direction((gpio_num_t)s_pins.m1_gpio, GPIO_MODE_OUTPUT);
@@ -262,7 +319,7 @@ bool turret_init(const turret_pins_t *pins, const turret_cfg_t *cfg)
     if (s_pins.limit_left_gpio >= 0)  in.pin_bit_mask |= (1ULL << s_pins.limit_left_gpio);
     if (s_pins.limit_right_gpio >= 0) in.pin_bit_mask |= (1ULL << s_pins.limit_right_gpio);
     if (in.pin_bit_mask) {
-    // 5        ESP_ERROR_CHECK(gpio_config(&in));
+           ESP_ERROR_CHECK(gpio_config(&in));
     }
 
     if (!servo_init(s_pins.servo_gpio)) {
@@ -306,3 +363,34 @@ void turret_get_frame_size(int *w, int *h)
     if (w) *w = s_frame_w;
     if (h) *h = s_frame_h;
 }
+
+
+
+void turret_mosfet_set(bool on)
+{
+    if (s_pins.mosfet_gpio < 0) return;
+    gpio_set_level((gpio_num_t)s_pins.mosfet_gpio, on ? 1 : 0);
+}
+
+void turret_update_target(bool has_target, float nx, float ny)
+{
+    const float cx = 0.5f;
+    const float cy = 0.5f;
+
+    const float center_tol = 0.02f; // 2% para considerar centrado
+
+    if (!has_target) {
+        turret_mosfet_set(false);
+        return;
+    }
+
+    float ex = nx - cx;
+    float ey = ny - cy;
+
+    float ax = (ex < 0) ? -ex : ex;
+    float ay = (ey < 0) ? -ey : ey;
+
+    bool centered = (ax < center_tol) && (ay < center_tol);
+    turret_mosfet_set(centered);
+}
+

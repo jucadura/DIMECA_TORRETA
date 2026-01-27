@@ -1005,23 +1005,24 @@ void app_main(void)
     pd_init();
         // --- TURRET pins (ajusta si tus GPIO son otros) ---
     turret_pins_t pins = {
-        .step_gpio = 28,
-        .dir_gpio = 29,
+        .step_gpio = 50,
+        .dir_gpio = 52,
         .en_gpio = -1, // si tienes ENABLE, pon el GPIO aquí
 
         .m0_gpio = -1,
         .m1_gpio = -1,
         .m2_gpio = -1,
+        .mosfet_gpio = 4,
 
         .servo_gpio = 30,
 
         // ✅ finales de carrera (un terminal al GPIO, el otro a GND)
-        .limit_left_gpio = 7,
+        .limit_left_gpio = 5,
         .limit_right_gpio = 48};
-
+        
     // --- Config (ya calibrado para 1/16 microsteps + tu velocidad 500us) ---
     turret_cfg_t cfg = {
-        .step_delay_us = 500,
+        .step_delay_us = 1000,
 
         .scan_limit_steps = 6400,
         .scan_steps_per_tick = 20,
@@ -1032,14 +1033,15 @@ void app_main(void)
         .step_max = 80,
 
         .kp_servo = 70.0f,
-        .servo_min_deg = 30,
-        .servo_max_deg = 150,
-        .servo_center_deg = 90,
+        .servo_min_deg = 0,
+        .servo_max_deg = 270,
+        .servo_center_deg = 135,
 
         .lost_timeout_ms = 700,
         .valid_age_ms = 350};
 
     turret_init(&pins, &cfg);
+   // turret_home();
     turret_start();
 
     // Reserva buffer para copiar 1 frame y correr PD fuera del stream

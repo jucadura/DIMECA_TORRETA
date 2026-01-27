@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "simple_video_server",
-    "project_version":    "102a415-dirty",
+    "project_version":    "4c93b5c-dirty",
     "project_path":       "C:/Users/j3cam/Documents/DIMECA_TORRETA",
     "idf_path":           "C:/Users/j3cam/esp/v5.4.3/esp-idf",
     "build_dir":          "C:/Users/j3cam/Documents/DIMECA_TORRETA/build",
