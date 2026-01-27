@@ -554,7 +554,8 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
         int64_t now_us = esp_timer_get_time();
 
         // Ejecuta PD aprox cada 150 ms (ajusta 100000..300000)
-        if ((now_us - last_pd_us) >= 1000000)
+        if ((now_us - last_pd_us) >= 2500000)  // 500ms
+
         {
             last_pd_us = now_us;
 
@@ -578,7 +579,7 @@ static esp_err_t image_stream_handler(httpd_req_t *req)
             }
 
             // Copia + notify
-            if (!s_pd_busy && s_pd_frame && buf.bytesused <= s_pd_frame_size && s_pd_task)
+            if (!locked && !s_pd_busy && s_pd_frame && buf.bytesused <= s_pd_frame_size && s_pd_task)
             {
                 s_pd_busy = true;
                 memcpy(s_pd_frame, video->buffer[buf.index], buf.bytesused);
@@ -1022,9 +1023,9 @@ void app_main(void)
         
     // --- Config (ya calibrado para 1/16 microsteps + tu velocidad 500us) ---
     turret_cfg_t cfg = {
-        .step_delay_us = 1000,
+        .step_delay_us = 500,
 
-        .scan_limit_steps = 6400,
+        .scan_limit_steps = 0,
         .scan_steps_per_tick = 20,
         .scan_tick_ms = 25,
 
