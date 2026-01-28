@@ -1,4 +1,4 @@
-# Install script for directory: C:/Users/j3cam/Documents/DIMECA_TORRETA/managed_components/espressif__esp_new_jpeg
+# Install script for directory: C:/Users/j3cam/Documents/DIMECA_TORRETA/DIMECA_TORRETA/managed_components/espressif__esp_new_jpeg
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

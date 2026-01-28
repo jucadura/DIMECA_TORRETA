@@ -1,5 +1,47 @@
 # Changelog
 
+## 2.11.5
+
+### Bug Fix
+
+* Renamed `H_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE_TIMEOUT` to `H_HOST_RESTART_NO_COMMUNICATION_WITH_SLAVE_TIMEOUT_MS` to clarify units are in milliseconds.
+
+## 2.11.4
+
+### Feature
+
+* ESP32-P4 C61 Core board support - Improvise
+
+### Bug Fix
+
+* TCP iPerf stability with documented performance optimizations
+
+#### Tested
+
+* Host power save and wake-up functionality
+
+  * Wake-up GPIOs:
+
+    * P4 Core Board – C61: IO04
+    * P4 Core Board – P4: IO06
+  * GPIOs disabled by default (`-1`) due to no physical connection; verified via jumper wiring and solder
+* Network split scenarios
+
+## 2.11.3
+
+### Bug Fix
+
+- made UART Hosted interface more stable:
+  - flush the input after reset. Rx line may toggle while resetting the co-processor, causing Host UART to store invalid data.
+  - check that offset in received payload header is valid: discard packet for invalid offsets.
+  - check flags in received payload only after the payload is considered valid
+
+## 2.11.2
+Minor fix: On Timeout/Failure, Print RPC req str instead of RPCId
+
+## 2.11.1
+Minor fixes: const qualifier violations while building
+
 ## 2.11.0
 
 ### Bug Fix

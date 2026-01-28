@@ -38221,6 +38221,16 @@
                                 "range": null,
                                 "title": "ESP32-P4-C6 Core Board with on-board C6",
                                 "type": "bool"
+                            },
+                            {
+                                "children": [],
+                                "depends_on": "SLAVE_IDF_TARGET_ESP32C61 && <choice ESP_HOSTED_P4_DEV_BOARD>",
+                                "help": null,
+                                "id": "ESP_HOSTED_P4_C61_CORE_BOARD",
+                                "name": "ESP_HOSTED_P4_C61_CORE_BOARD",
+                                "range": null,
+                                "title": "ESP32-P4-C61 Core Board with on-board C61",
+                                "type": "bool"
                             }
                         ],
                         "depends_on": "IDF_TARGET_ESP32P4 && ESP_HOSTED_ENABLED",

@@ -1,4 +1,4 @@
-/* * Data converted from C:/Users/j3cam/Documents/DIMECA_TORRETA/build/espdl_models/pedestrian_detect.espdl
+/* * Data converted from C:/Users/j3cam/Documents/DIMECA_TORRETA/DIMECA_TORRETA/build/espdl_models/pedestrian_detect.espdl
  */
 .data
 #if !defined (__APPLE__) && !defined (__linux__)

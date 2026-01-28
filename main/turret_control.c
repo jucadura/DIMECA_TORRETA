@@ -1,96 +1,171 @@
 #include "turret_control.h"
 
 #include <math.h>
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_rom_sys.h"     // esp_rom_delay_us
+#include "esp_rom_sys.h"
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 
-#include "pd_runner.h"       // pd_get_last()
+#include "pd_runner.h"
 
 static const char *TAG = "TURRET";
 
-// =======================
+// =====================================================
 // Config / Estado global
-// =======================
+// =====================================================
 static turret_pins_t s_pins;
 static turret_cfg_t  s_cfg;
 
 static TaskHandle_t  s_task = NULL;
 static bool          s_running = false;
 
-// Stepper state
-static int32_t s_pos_steps = 0;
-static int     s_scan_dir = +1;
-// Bloqueo temporal de dirección cuando se golpea un endstop
-static int64_t s_block_left_until_ms  = 0;   // no permitir mover a la izquierda hasta este tiempo
-static int64_t s_block_right_until_ms = 0;   // no permitir mover a la derecha hasta este tiempo
-
-// Servo state
-static int     s_servo_deg = 90;
-
-// Tracking time
-static int64_t s_last_seen_ms = 0;
-
-// Frame size real (set desde simple_video_server_example.c)
+// Frame size real
 static int s_frame_w = 640;
 static int s_frame_h = 480;
-// =======================
-// Lock / anti-jitter
-// =======================
 
-// Zona para "considerar centrado" (más pequeña)
-#define LOCK_IN_X   0.02f
-#define LOCK_IN_Y   0.02f
+// Stepper
+static int32_t s_pos_steps = 0;
+static int     s_scan_dir  = +1;
 
-// Zona para "salir del lock" (más grande) -> histéresis
-#define LOCK_OUT_X  0.05f
-#define LOCK_OUT_Y  0.05f
+// Endstop blocks
+static int64_t s_block_left_until_ms  = 0;
+static int64_t s_block_right_until_ms = 0;
 
-// Tiempo mínimo centrado para bloquear (ms)
-#define LOCK_STABLE_MS  250
+// Servo
+static int s_servo_deg = 90;
 
-// Límite de movimiento por tick (suaviza)
-#define SERVO_MAX_DEG_PER_TICK   3    // prueba 2..5
-#define STEPPER_MAX_STEPS_TICK   30   // extra (aparte de step_max)
+// Tracking
+static int64_t s_last_seen_ms = 0;
+static int64_t s_track_lost_since = 0;
 
-// =======================================
-// Endstops: NO a 3V3 => presionado = 1
-// (input pulldown, al presionar sube a 3V3)
-// =======================================
+// Flags
+static bool s_homing_done = false;
+
+// =====================================================
+// MOSFET (motor DC vibración) - GPIO 4
+// =====================================================
+
+// Pulsos (ajusta según vibración real)
+#define MOSFET_ON_MS       120     // encendido corto
+#define MOSFET_OFF_MS      280     // apagado para descansar
+#define MOSFET_MAX_MS     1500     // máximo vibrando continuo mientras locked
+#define MOSFET_COOLDOWN   1200     // descanso antes de volver a vibrar si sigue locked
+#define HOMING_DELAY_US  250   // ejemplo: más rápido que 500
+
+static bool    s_mosfet_state = false;
+static int64_t s_mosfet_next_toggle_ms = 0;
+static int64_t s_mosfet_lock_start_ms = 0; // >0 vibrando, <0 cooldown_until, 0 idle
+
+// =====================================================
+// Máquina de estados
+// =====================================================
+typedef enum {
+    TSTATE_HOMING_FIND_FIRST = 0,
+    TSTATE_HOMING_FIND_SECOND,
+    TSTATE_HOMING_GO_CENTER,
+    TSTATE_SEARCH_STEPPER,
+    TSTATE_SEARCH_SERVO,
+    TSTATE_CONFIRM,
+    TSTATE_TRACK
+} turret_state_t;
+
+static turret_state_t s_state = TSTATE_HOMING_FIND_FIRST;
+
+// Homing data
+static int32_t s_range_steps = 0;
+static int32_t s_steps_from_first = 0;
+static int     s_first_is_left = -1;   // 1=LEFT, 0=RIGHT
+
+// Search
+static int32_t s_search_step_size = 0;
+static int32_t s_search_remaining = 0;
+static int     s_search_servo_phase = 0;
+
+// Confirm
+static int     s_confirm_hits = 0;
+static int64_t s_confirm_start_ms = 0;
+
+// Hold / settle
+static int64_t s_hold_until_ms = 0;
+
+// =====================================================
+// Ajustes
+// =====================================================
 #define ENDSTOP_PRESSED_LEVEL 1
 
-// =======================
-// Helpers de tiempo
-// =======================
+#define STEPPER_SETTLE_MS   60
+#define SERVO_SETTLE_MS     180   // ✅ más lento (antes 120)
+
+// Deadzones
+#define DEAD_X  0.04f
+#define DEAD_Y  0.06f            // ✅ un poquito más deadzone para no vibrar
+
+// Lock anti-jitter
+#define LOCK_IN_X      0.035f
+#define LOCK_IN_Y      0.045f
+#define LOCK_OUT_X     0.070f
+#define LOCK_OUT_Y     0.090f
+#define LOCK_STABLE_MS 400
+
+// ✅ Servo más suave
+#define SERVO_MAX_DEG_PER_TICK   1   // antes 3
+#define STEPPER_MAX_STEPS_TICK   30
+
+// PD filtro
+#define PD_MIN_SCORE 0.55f
+#define PD_MIN_AREA  (45 * 45)
+
+// =====================================================
+// Forward declarations
+// =====================================================
+static void turret_homing_tick(void);
+static void turret_search_tick(void);
+static void turret_confirm_tick(void);
+static void turret_track_from_pd(void);
+
+static bool  pd_has_valid_target(pd_box_t *best_out);
+static void  turret_escape_from_limits(void);
+static void  release_current_endstop(int hit_side);
+
+// =====================================================
 static inline int64_t now_ms(void)
 {
     return (int64_t)(esp_timer_get_time() / 1000ULL);
 }
 
-// =======================
-// Helpers Endstops (ACTIVE-HIGH)
-// =======================
+// =====================================================
+// Endstops
+// =====================================================
 static inline bool endstop_left_hit(void)
 {
-    if (s_pins.limit_left_gpio < 0) return false;
-    return gpio_get_level((gpio_num_t)s_pins.limit_left_gpio) == ENDSTOP_PRESSED_LEVEL;
+    return (s_pins.limit_left_gpio >= 0 &&
+            gpio_get_level((gpio_num_t)s_pins.limit_left_gpio) == ENDSTOP_PRESSED_LEVEL);
 }
 
 static inline bool endstop_right_hit(void)
 {
-    if (s_pins.limit_right_gpio < 0) return false;
-    return gpio_get_level((gpio_num_t)s_pins.limit_right_gpio) == ENDSTOP_PRESSED_LEVEL;
+    return (s_pins.limit_right_gpio >= 0 &&
+            gpio_get_level((gpio_num_t)s_pins.limit_right_gpio) == ENDSTOP_PRESSED_LEVEL);
 }
 
-// =======================
-// Stepper low-level
-// =======================
+// devuelve: 1 si LEFT, 0 si RIGHT, -1 si ninguno
+static inline int which_endstop_hit(void)
+{
+    if (endstop_left_hit())  return 1;
+    if (endstop_right_hit()) return 0;
+    return -1;
+}
+
+// =====================================================
+// Stepper
+// =====================================================
 static void step_pulse(uint32_t delay_us)
 {
     gpio_set_level((gpio_num_t)s_pins.step_gpio, 1);
@@ -99,98 +174,153 @@ static void step_pulse(uint32_t delay_us)
     esp_rom_delay_us(delay_us);
 }
 
-/**
- * Mueve el stepper `steps` pasos en dirección dir:
- * dir < 0: izquierda
- * dir > 0: derecha
- *
- * Protección: si el endstop correspondiente está presionado, no avanza a ese lado.
- */
-static void stepper_move_steps(int dir, int steps)
+static int stepper_move_steps(int dir, int steps)
 {
-    if (steps <= 0) return;
+    if (steps <= 0) return 0;
 
+    int moved = 0;
     int64_t t = now_ms();
 
-    // ✅ Si ese lado está bloqueado temporalmente, no lo intentes
-    if (dir < 0 && t < s_block_left_until_ms)  return;
-    if (dir > 0 && t < s_block_right_until_ms) return;
+    if (dir < 0 && t < s_block_left_until_ms)  return 0;
+    if (dir > 0 && t < s_block_right_until_ms) return 0;
 
-    // ✅ Si el endstop está presionado, bloquea ese lado un rato y no avances hacia ahí
-    if (dir < 0 && endstop_left_hit())  { s_block_left_until_ms  = t + 400; return; }
-    if (dir > 0 && endstop_right_hit()) { s_block_right_until_ms = t + 400; return; }
+    // Si ya está presionado, no empujes hacia adentro
+    if (dir < 0 && endstop_left_hit())  return 0;
+    if (dir > 0 && endstop_right_hit()) return 0;
 
     gpio_set_level((gpio_num_t)s_pins.dir_gpio, (dir > 0) ? 1 : 0);
 
+    const int YIELD_EVERY = 40;
+
     for (int i = 0; i < steps; i++) {
+        if (dir < 0 && endstop_left_hit())  break;
+        if (dir > 0 && endstop_right_hit()) break;
 
-        // Si se activa durante el movimiento, bloquea y corta
-        if (dir < 0 && endstop_left_hit())  { s_block_left_until_ms  = now_ms() + 400; break; }
-        if (dir > 0 && endstop_right_hit()) { s_block_right_until_ms = now_ms() + 400; break; }
+uint32_t delay = s_cfg.step_delay_us;
 
-        step_pulse(s_cfg.step_delay_us);
-        s_pos_steps += (dir > 0) ? 1 : -1;
-
-        if (s_cfg.scan_limit_steps > 0) {
-            if (s_pos_steps <= -s_cfg.scan_limit_steps) { s_scan_dir = +1; break; }
-            if (s_pos_steps >=  s_cfg.scan_limit_steps) { s_scan_dir = -1; break; }
-        }
-    }
+// Si estoy en estados de homing, uso delay más rápido
+if (s_state == TSTATE_HOMING_FIND_FIRST || s_state == TSTATE_HOMING_FIND_SECOND) {
+    delay = HOMING_DELAY_US;
 }
 
+step_pulse(delay);        s_pos_steps += (dir > 0) ? 1 : -1;
+        moved++;
 
-// =======================
-// Servo (LEDC)
-// =======================
+        // ✅ deja respirar WiFi/PD/HTTP
+        if ((moved % YIELD_EVERY) == 0) vTaskDelay(1);
+    }
+
+    return moved;
+}
+
+// =====================================================
+// Servo
+// =====================================================
 static bool servo_init(int gpio)
 {
     ledc_timer_config_t tcfg = {
-        .speed_mode       = LEDC_LOW_SPEED_MODE,
-        .duty_resolution  = LEDC_TIMER_16_BIT,
-        .timer_num        = LEDC_TIMER_0,
-        .freq_hz          = 50,
-        .clk_cfg          = LEDC_AUTO_CLK
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_16_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 50,
+        .clk_cfg = LEDC_AUTO_CLK
     };
     if (ledc_timer_config(&tcfg) != ESP_OK) return false;
 
     ledc_channel_config_t ccfg = {
-        .gpio_num       = gpio,
-        .speed_mode     = LEDC_LOW_SPEED_MODE,
-        .channel        = LEDC_CHANNEL_0,
-        .timer_sel      = LEDC_TIMER_0,
-        .duty           = 0,
-        .hpoint         = 0,
-        .intr_type      = LEDC_INTR_DISABLE
+        .gpio_num = gpio,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
+        .intr_type = LEDC_INTR_DISABLE
     };
     return ledc_channel_config(&ccfg) == ESP_OK;
 }
 
-/**
- * Mueve servo en grados (clamp con min/max).
- * Convierte grados a pulso típico 500..2500us (aprox 0..270°).
- */
 static void servo_set_deg(int deg)
 {
     if (deg < s_cfg.servo_min_deg) deg = s_cfg.servo_min_deg;
     if (deg > s_cfg.servo_max_deg) deg = s_cfg.servo_max_deg;
     s_servo_deg = deg;
 
-    const int min_us = 500;
-    const int max_us = 2500;
-
-    // Asumiendo servo 0..270°
-    int pulse_us = min_us + (deg * (max_us - min_us)) / 270;
-
-    // Periodo 20ms => 20000us, duty 16-bit (0..65535)
-    uint32_t duty = (uint32_t)((pulse_us * 65535ULL) / 20000ULL);
+    // 500us => 0°, 2500us => 270°
+    int pulse_us = 500 + (deg * 2000) / 270;
+    uint32_t duty = (uint32_t)((pulse_us * 65535UL) / 20000UL);
 
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-// =======================
-// Tracking (PD)
-// =======================
+static inline void mosfet_write(bool on)
+{
+    s_mosfet_state = on;
+
+    if (s_pins.mosfet_gpio < 0) return; // por si no quieres usar MOSFET
+    gpio_set_level((gpio_num_t)s_pins.mosfet_gpio, on ? 1 : 0);
+}
+
+static void mosfet_stop(void)
+{
+    mosfet_write(false);
+    s_mosfet_next_toggle_ms = 0;
+    s_mosfet_lock_start_ms = 0;
+}
+
+static void mosfet_pulse_when_locked(bool locked_now)
+{
+    int64_t t = now_ms();
+
+    if (!locked_now) {
+        mosfet_stop();
+        return;
+    }
+
+    // si recién entré a locked -> arranco ciclo
+    if (s_mosfet_lock_start_ms == 0) {
+        s_mosfet_lock_start_ms = t;
+        s_mosfet_next_toggle_ms = t;   // toggle ya
+        mosfet_write(false);
+    }
+
+    // cooldown
+    if (s_mosfet_lock_start_ms < 0) {
+        int64_t cooldown_until = -s_mosfet_lock_start_ms;
+        if (t < cooldown_until) {
+            mosfet_write(false);
+            return;
+        }
+        // terminó cooldown, reinicio vibración
+        s_mosfet_lock_start_ms = t;
+        s_mosfet_next_toggle_ms = t;
+        mosfet_write(false);
+    }
+
+    // límite de vibración continua
+    int64_t elapsed = t - s_mosfet_lock_start_ms;
+    if (elapsed >= MOSFET_MAX_MS) {
+        mosfet_write(false);
+        s_mosfet_lock_start_ms = -(t + MOSFET_COOLDOWN); // entro a cooldown
+        s_mosfet_next_toggle_ms = 0;
+        return;
+    }
+
+    // toggle ON/OFF por tiempo
+    if (t >= s_mosfet_next_toggle_ms) {
+        if (!s_mosfet_state) {
+            mosfet_write(true);
+            s_mosfet_next_toggle_ms = t + MOSFET_ON_MS;
+        } else {
+            mosfet_write(false);
+            s_mosfet_next_toggle_ms = t + MOSFET_OFF_MS;
+        }
+    }
+}
+
+// =====================================================
+// PD helpers
+// =====================================================
 static bool pick_best_box(const pd_result_t *r, pd_box_t *best)
 {
     if (!r || r->count <= 0) return false;
@@ -210,235 +340,435 @@ static bool pick_best_box(const pd_result_t *r, pd_box_t *best)
     return true;
 }
 
-/**
- * Lee PD, calcula error (ex, ey) y aplica:
- * - Stepper (pan) según ex
- * - Servo (tilt) según ey
- * - MOSFET: prende solo si está centrado estable con histéresis
- */
-static void turret_track_from_pd(void)
+static bool pd_has_valid_target(pd_box_t *best_out)
 {
     pd_result_t r;
     pd_get_last(&r);
 
-    int64_t t = now_ms();
+    if (r.count <= 0) return false;
 
-    // 1) si no hay detección => apaga MOSFET y no muevas
-    if (r.count <= 0) {
-        turret_mosfet_set(false);
-        return;
-    }
+    pd_box_t b;
+    if (!pick_best_box(&r, &b)) return false;
 
-    // 2) descarta detección vieja
-    if (s_cfg.valid_age_ms > 0 && (t - (int64_t)r.ts_ms) > (int64_t)s_cfg.valid_age_ms) {
-        return;
-    }
+    int area = b.w * b.h;
+    if (b.score < PD_MIN_SCORE || area < PD_MIN_AREA) return false;
 
-    // 3) escoger el box principal (mayor área)
-    int best = 0;
-    int best_area = r.boxes[0].w * r.boxes[0].h;
-    for (int i = 1; i < r.count; i++) {
-        int area = r.boxes[i].w * r.boxes[i].h;
-        if (area > best_area) { best_area = area; best = i; }
-    }
-
-    pd_box_t b = r.boxes[best];
-
-    // 4) centro del bbox en pixeles
-    float cx = (float)(b.x + b.w * 0.5f);
-    float cy = (float)(b.y + b.h * 0.5f);
-
-    // 5) normalizar 0..1 con el frame real
-    float W = (float)((s_frame_w > 0) ? s_frame_w : 640);
-    float H = (float)((s_frame_h > 0) ? s_frame_h : 480);
-
-    float nx = cx / W;  // 0..1
-    float ny = cy / H;  // 0..1
-
-    // 6) error respecto al centro (0.5,0.5)
-    float ex = 0.5f - nx;  // + => está a la izquierda del centro
-    float ey = 0.5f - ny;  // + => está arriba del centro
-    
-    // 7) deadzone (zona muerta para que no tiemble)
-    const float DEAD_X = 0.03f;  // 3% ancho
-    const float DEAD_Y = 0.03f;  // 3% alto
-
-    // --------- MOSFET: solo ON cuando está centrado ---------
-    const float ON_TOL  = 0.02f;
-    const float OFF_TOL = 0.05f;
-    static bool mosfet_on = false;
-    static int64_t centered_since_ms = 0;
-
-    float ax = fabsf(ex);
-    float ay = fabsf(ey);
-// --------- LOCK: si está centrado y estable, nos quedamos quietos ----------
-static bool locked = false;
-static int64_t lock_since_ms = 0;
-
-bool in_lock_zone  = (ax < LOCK_IN_X)  && (ay < LOCK_IN_Y);
-bool out_lock_zone = (ax > LOCK_OUT_X) || (ay > LOCK_OUT_Y);
-
-if (!locked) {
-    if (in_lock_zone) {
-        if (lock_since_ms == 0) lock_since_ms = t;
-        if ((t - lock_since_ms) >= LOCK_STABLE_MS) {
-            locked = true;         // ✅ queda quieto
-        }
-    } else {
-        lock_since_ms = 0;
-    }
-} else {
-    // Si ya está locked, solo desbloquea si te sales bastante
-    if (out_lock_zone) {
-        locked = false;
-        lock_since_ms = 0;
-    }
+    if (best_out) *best_out = b;
+    return true;
 }
 
-// Si está locked => no mover stepper ni servo
-if (locked) {
-    s_last_seen_ms = t;
-    return;
-}
-
-    bool in_on_zone   = (ax < ON_TOL) && (ay < ON_TOL);
-    bool out_off_zone = (ax > OFF_TOL) || (ay > OFF_TOL);
-
-    if (!mosfet_on) {
-        if (in_on_zone) {
-            if (centered_since_ms == 0) centered_since_ms = t;
-            if ((t - centered_since_ms) >= 250) {
-                mosfet_on = true;
-                //turret_mosfet_set(true);
-            }
-        } else {
-            centered_since_ms = 0;
-        }
-    } else {
-        if (out_off_zone) {
-            mosfet_on = false;
-            centered_since_ms = 0;
-            //turret_mosfet_set(false);
-        }
-    }
-
-// --------- X => STEPPER ---------
-if (ax > DEAD_X) {
-
-    // tu convención: ex>0 => target a la izq => gira hacia izq
-    int dir = (ex > 0) ? -1 : +1;
-
-    int steps = (int)(ax * s_cfg.kp_step);
-
-    if (steps < s_cfg.step_min) steps = s_cfg.step_min;
-    if (steps > s_cfg.step_max) steps = s_cfg.step_max;
-
-    // límite extra por tick (anti-locos)
-    if (steps > STEPPER_MAX_STEPS_TICK) steps = STEPPER_MAX_STEPS_TICK;
-
-    stepper_move_steps(dir, steps);
-}
-
-    // --------- Y => SERVO ---------
-if (ay > DEAD_Y) {
-    int delta = (int)(ey * s_cfg.kp_servo);
-
-    // límite por tick (anti-saltos)
-    if (delta >  SERVO_MAX_DEG_PER_TICK) delta =  SERVO_MAX_DEG_PER_TICK;
-    if (delta < -SERVO_MAX_DEG_PER_TICK) delta = -SERVO_MAX_DEG_PER_TICK;
-
-    // si el delta quedó muy chiquito, ni te muevas
-    if (delta != 0) {
-        int new_deg = s_servo_deg + delta;
-        servo_set_deg(new_deg);
-    }
-}
-
-
-    s_last_seen_ms = t;
-}
-
-
-// =======================
-// Scan (sin target)
-// =======================
-static void turret_scan_tick(void)
-{
-    // Si está golpeado un endstop, cambia dirección
-    if (endstop_left_hit())  s_scan_dir = +1;
-    if (endstop_right_hit()) s_scan_dir = -1;
-
-    stepper_move_steps(s_scan_dir, s_cfg.scan_steps_per_tick);
-}
-
-/**
- * Seguridad: si el motor DC empuja y pega un endstop,
- * apagamos MOSFET y nos movemos al lado contrario hasta liberar.
- */
+// =====================================================
+// Seguridad: escape de endstops (runtime)
+// =====================================================
 static void turret_escape_from_limits(void)
 {
-    // Si pega el izquierdo: apagar DC + mover a la derecha hasta soltar
+    int64_t t = now_ms();
+
     if (endstop_left_hit()) {
-        turret_mosfet_set(false);
-        s_scan_dir = +1;                 // escaneo se va a la derecha
-        s_block_left_until_ms = now_ms() + 800;  // bloquea volver a la izquierda
+        s_scan_dir = +1;
+        s_block_left_until_ms = t + 500;
 
-        // soltamos el switch con pasitos
-        int guard = 2000; // por si acaso, para no quedarnos infinitos
+        int guard = 2000;
         while (endstop_left_hit() && guard-- > 0) {
-            stepper_move_steps(+1, 2);
-            vTaskDelay(pdMS_TO_TICKS(1));
+            (void)stepper_move_steps(+1, 2);
+            vTaskDelay(1);
         }
-
-        // backoff extra para separarnos
-        stepper_move_steps(+1, 200);
-        return;
+        (void)stepper_move_steps(+1, 80);
     }
 
-    // Si pega el derecho: apagar DC + mover a la izquierda hasta soltar
     if (endstop_right_hit()) {
-        turret_mosfet_set(false);
         s_scan_dir = -1;
-        s_block_right_until_ms = now_ms() + 800;
+        s_block_right_until_ms = t + 500;
 
         int guard = 2000;
         while (endstop_right_hit() && guard-- > 0) {
-            stepper_move_steps(-1, 2);
-            vTaskDelay(pdMS_TO_TICKS(1));
+            (void)stepper_move_steps(-1, 2);
+            vTaskDelay(1);
+        }
+        (void)stepper_move_steps(-1, 80);
+    }
+}
+
+/**
+ * Release REAL del endstop + backoff extra
+ * hit_side: 1=LEFT, 0=RIGHT
+ */
+static void release_current_endstop(int hit_side)
+{
+    int dir_off = (hit_side == 1) ? +1 : -1;
+
+    int guard = 3000;
+    while (guard-- > 0) {
+        if (hit_side == 1 && !endstop_left_hit())  break;
+        if (hit_side == 0 && !endstop_right_hit()) break;
+
+        (void)stepper_move_steps(dir_off, 2);
+        vTaskDelay(1);
+    }
+
+    (void)stepper_move_steps(dir_off, 120);
+}
+
+// =====================================================
+// HOMING (robusto)
+// =====================================================
+static void turret_homing_tick(void)
+{
+    int64_t t = now_ms();
+    if (t < s_hold_until_ms) return;
+
+    mosfet_pulse_when_locked(false);
+
+    int hit = which_endstop_hit();
+
+    switch (s_state)
+    {
+    case TSTATE_HOMING_FIND_FIRST:
+        if (hit == -1) {
+            (void)stepper_move_steps(s_scan_dir, s_cfg.scan_steps_per_tick);
+            s_hold_until_ms = t + STEPPER_SETTLE_MS;
+            return;
         }
 
-        stepper_move_steps(-1, 200);
+        s_first_is_left = (hit == 1) ? 1 : 0;
+        s_steps_from_first = 0;
+
+        ESP_LOGI(TAG, "HOMING: first endstop = %s", s_first_is_left ? "LEFT" : "RIGHT");
+
+        release_current_endstop(hit);
+
+        s_scan_dir = (s_first_is_left ? +1 : -1);
+        s_state = TSTATE_HOMING_FIND_SECOND;
+        s_hold_until_ms = t + 120;
+        return;
+
+    case TSTATE_HOMING_FIND_SECOND:
+        if (hit != -1) {
+            int expected_second = s_first_is_left ? 0 : 1;
+
+            if (hit != expected_second) {
+                release_current_endstop(hit);
+                s_hold_until_ms = t + 120;
+                return;
+            }
+
+            s_range_steps = (s_steps_from_first > 0) ? s_steps_from_first : 0;
+
+            ESP_LOGI(TAG, "HOMING: second endstop hit, range_steps=%d", (int)s_range_steps);
+
+            release_current_endstop(hit);
+
+            // prepara segmento de búsqueda
+            {
+                int parts = 10;
+                int32_t seg = (s_range_steps > 0) ? (s_range_steps / parts) : 0;
+                if (seg < 60)  seg = 60;
+                if (seg > 600) seg = 600;
+                s_search_step_size = seg;
+                s_search_remaining = 0;
+                ESP_LOGI(TAG, "SEARCH: segment=%d", (int)s_search_step_size);
+            }
+
+            s_scan_dir = (s_first_is_left ? -1 : +1);
+            s_state = TSTATE_HOMING_GO_CENTER;
+            s_hold_until_ms = t + 120;
+            return;
+        }
+
+        s_steps_from_first += stepper_move_steps(s_scan_dir, s_cfg.scan_steps_per_tick);
+        s_hold_until_ms = t + STEPPER_SETTLE_MS;
+        return;
+
+    case TSTATE_HOMING_GO_CENTER:
+    {
+        int32_t half = s_range_steps / 2;
+
+        if (half > 0) {
+            int32_t rem = half;
+            const int CHUNK = 200;
+            while (rem > 0) {
+                int c = (rem > CHUNK) ? CHUNK : rem;
+                (void)stepper_move_steps(s_scan_dir, c);
+                rem -= c;
+                vTaskDelay(1);
+            }
+        }
+
+        servo_set_deg(s_cfg.servo_center_deg);
+
+        // ✅ importantísimo: ya NO vuelvas a homing jamás
+        s_homing_done = true;
+
+        s_state = TSTATE_SEARCH_STEPPER;
+        s_hold_until_ms = t + 150;
+
+        ESP_LOGI(TAG, "HOMING DONE -> SEARCH");
+        return;
+    }
+
+    default:
         return;
     }
 }
 
-// =======================
-// Task principal
-// =======================
+// =====================================================
+// SEARCH
+// =====================================================
+static void turret_search_tick(void)
+{
+    int64_t t = now_ms();
+    if (t < s_hold_until_ms) return;
+
+    mosfet_pulse_when_locked(false);
+
+    pd_box_t b;
+    if (pd_has_valid_target(&b)) {
+        mosfet_pulse_when_locked(false);
+
+        s_confirm_hits = 0;
+        s_confirm_start_ms = t;
+        s_state = TSTATE_CONFIRM;
+        s_hold_until_ms = t + 80;
+        ESP_LOGI(TAG, "SEARCH: target seen -> CONFIRM");
+        return;
+    }
+
+    turret_escape_from_limits();
+    if (endstop_left_hit() || endstop_right_hit()) {
+        s_search_remaining = 0;
+    }
+
+    if (s_state == TSTATE_SEARCH_STEPPER) {
+
+        if (endstop_left_hit())  s_scan_dir = +1;
+        if (endstop_right_hit()) s_scan_dir = -1;
+
+        int32_t seg = (s_search_step_size > 0) ? s_search_step_size : s_cfg.scan_steps_per_tick;
+        if (s_search_remaining <= 0) s_search_remaining = seg;
+
+        int chunk = s_cfg.scan_steps_per_tick;
+        if (chunk > s_search_remaining) chunk = s_search_remaining;
+
+        (void)stepper_move_steps(s_scan_dir, chunk);
+        s_search_remaining -= chunk;
+
+        s_hold_until_ms = t + STEPPER_SETTLE_MS;
+
+        if (s_search_remaining <= 0) {
+            s_state = TSTATE_SEARCH_SERVO;
+        }
+        return;
+    }
+
+    if (s_state == TSTATE_SEARCH_SERVO) {
+        int center = s_cfg.servo_center_deg;
+
+        int target_deg = center;
+        switch (s_search_servo_phase % 3) {
+            case 0: target_deg = center + 12; break;
+            case 1: target_deg = center - 12; break;
+            default: target_deg = center; break;
+        }
+        s_search_servo_phase++;
+
+        servo_set_deg(target_deg);
+        s_hold_until_ms = t + SERVO_SETTLE_MS;
+
+        s_state = TSTATE_SEARCH_STEPPER;
+        return;
+    }
+
+    s_state = TSTATE_SEARCH_STEPPER;
+}
+
+// =====================================================
+// CONFIRM
+// =====================================================
+static void turret_confirm_tick(void)
+{
+    int64_t t = now_ms();
+
+    const int64_t CONFIRM_TIMEOUT_MS = 900;
+    const int     CONFIRM_NEED_HITS  = 3;
+
+    if (s_confirm_start_ms == 0) s_confirm_start_ms = t;
+
+    pd_box_t b;
+    bool ok = pd_has_valid_target(&b);
+
+    if (ok) {
+        s_confirm_hits++;
+        s_hold_until_ms = t + 80;
+
+        if (s_confirm_hits >= CONFIRM_NEED_HITS) {
+            s_state = TSTATE_TRACK;
+            s_hold_until_ms = t + 120;
+
+            s_last_seen_ms = t;
+            s_track_lost_since = 0;
+
+            ESP_LOGI(TAG, "CONFIRM: OK -> TRACK");
+        }
+        return;
+    }
+
+    s_confirm_hits = 0;
+
+    if ((t - s_confirm_start_ms) > CONFIRM_TIMEOUT_MS) {
+        mosfet_pulse_when_locked(false);
+
+        s_state = TSTATE_SEARCH_STEPPER;
+        s_confirm_start_ms = 0;
+        s_confirm_hits = 0;
+        s_hold_until_ms = t + 120;
+        ESP_LOGI(TAG, "CONFIRM: timeout -> SEARCH");
+    }
+}
+
+// =====================================================
+// TRACK
+// =====================================================
+static void turret_track_from_pd(void)
+{
+    int64_t t = now_ms();
+    if (t < s_hold_until_ms) return;
+
+    pd_result_t r;
+    pd_get_last(&r);
+
+    if (r.count <= 0) {
+        mosfet_pulse_when_locked(false);
+
+        if (s_track_lost_since == 0) s_track_lost_since = t;
+
+        if ((t - s_track_lost_since) > (int64_t)s_cfg.lost_timeout_ms) {
+            s_state = TSTATE_SEARCH_STEPPER;
+            s_track_lost_since = 0;
+            s_hold_until_ms = t + 150;
+            ESP_LOGI(TAG, "TRACK: lost -> SEARCH");
+        }
+        return;
+    }
+
+    pd_box_t b;
+    if (!pick_best_box(&r, &b)) return;
+
+    int area = b.w * b.h;
+    if (b.score < PD_MIN_SCORE || area < PD_MIN_AREA) {
+        mosfet_pulse_when_locked(false);
+
+        if (s_track_lost_since == 0) s_track_lost_since = t;
+        return;
+    }
+
+    s_last_seen_ms = t;
+    s_track_lost_since = 0;
+
+    float W = (float)((s_frame_w > 0) ? s_frame_w : 640);
+    float H = (float)((s_frame_h > 0) ? s_frame_h : 480);
+
+    float nx = (float)(b.x + b.w * 0.5f) / W;
+    float ny = (float)(b.y + b.h * 0.5f) / H;
+
+    float ex = 0.5f - nx;
+    float ey = 0.5f - ny;
+
+    float ax = fabsf(ex);
+    float ay = fabsf(ey);
+
+    static bool locked = false;
+    static int64_t lock_since = 0;
+
+    bool in_lock  = (ax < LOCK_IN_X) && (ay < LOCK_IN_Y);
+    bool out_lock = (ax > LOCK_OUT_X) || (ay > LOCK_OUT_Y);
+
+    if (!locked) {
+        if (in_lock) {
+            if (lock_since == 0) lock_since = t;
+            if ((t - lock_since) >= LOCK_STABLE_MS) locked = true;
+        } else {
+            lock_since = 0;
+        }
+    } else {
+        if (out_lock) {
+            locked = false;
+            lock_since = 0;
+        }
+    }
+
+    if (endstop_left_hit() || endstop_right_hit()) {
+        locked = false;
+        lock_since = 0;
+    }
+
+    if (locked) {
+        mosfet_pulse_when_locked(true);
+        return;
+    } else {
+        mosfet_pulse_when_locked(false);
+    }
+
+    // X => stepper
+    if (ax > DEAD_X) {
+        int dir = (ex > 0) ? -1 : +1;
+
+        if (endstop_left_hit())  dir = +1;
+        if (endstop_right_hit()) dir = -1;
+
+        int steps = (int)(ax * s_cfg.kp_step);
+        if (steps < s_cfg.step_min) steps = s_cfg.step_min;
+        if (steps > s_cfg.step_max) steps = s_cfg.step_max;
+        if (steps > STEPPER_MAX_STEPS_TICK) steps = STEPPER_MAX_STEPS_TICK;
+
+        (void)stepper_move_steps(dir, steps);
+        s_hold_until_ms = t + STEPPER_SETTLE_MS;
+    }
+
+    // Y => servo
+    if (ay > DEAD_Y) {
+        int delta = (int)(ey * s_cfg.kp_servo * 0.35f);
+        if (delta >  SERVO_MAX_DEG_PER_TICK) delta =  SERVO_MAX_DEG_PER_TICK;
+        if (delta < -SERVO_MAX_DEG_PER_TICK) delta = -SERVO_MAX_DEG_PER_TICK;
+
+        if (delta != 0) {
+            servo_set_deg(s_servo_deg + delta);
+            s_hold_until_ms = t + SERVO_SETTLE_MS;
+        }
+    }
+}
+
+// =====================================================
+// TASK
+// =====================================================
 static void turret_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "turret task start");
 
-    s_last_seen_ms = now_ms();
-
     while (s_running) {
 
-        // ✅ Siempre primero seguridad física
-        turret_escape_from_limits();
+        // HOMING solo una vez
+        if (!s_homing_done) {
+            turret_homing_tick();
+            vTaskDelay(pdMS_TO_TICKS(s_cfg.scan_tick_ms));
+            continue;
+        }
 
-        int64_t t = now_ms();
+        // settle/hold
+        if (now_ms() < s_hold_until_ms) {
+            vTaskDelay(pdMS_TO_TICKS(s_cfg.scan_tick_ms));
+            continue;
+        }
 
-        // Tracking
-        int64_t before = s_last_seen_ms;
-        turret_track_from_pd();
-        bool saw_recent = (s_last_seen_ms != before);
-
-        // Si no vimos nada en esta iteración, y pasó el timeout => escanear
-        if (!saw_recent) {
-            if ((t - s_last_seen_ms) > (int64_t)s_cfg.lost_timeout_ms) {
-                turret_scan_tick();
-            }
+        // Máquina principal
+        if (s_state == TSTATE_SEARCH_STEPPER || s_state == TSTATE_SEARCH_SERVO) {
+            turret_search_tick();
+        } else if (s_state == TSTATE_CONFIRM) {
+            turret_confirm_tick();
+        } else if (s_state == TSTATE_TRACK) {
+            turret_track_from_pd();
+        } else {
+            s_state = TSTATE_SEARCH_STEPPER;
         }
 
         vTaskDelay(pdMS_TO_TICKS(s_cfg.scan_tick_ms));
@@ -446,21 +776,21 @@ static void turret_task(void *arg)
 
     ESP_LOGI(TAG, "turret task stop");
     s_task = NULL;
+    mosfet_stop();
+
     vTaskDelete(NULL);
 }
 
-// =======================
-// API pública
-// =======================
+// =====================================================
+// API
+// =====================================================
 bool turret_init(const turret_pins_t *pins, const turret_cfg_t *cfg)
 {
     if (!pins || !cfg) return false;
     s_pins = *pins;
     s_cfg  = *cfg;
 
-    // -----------------------
-    // GPIO Outputs (step/dir/en)
-    // -----------------------
+    // GPIO step/dir
     gpio_config_t out = {
         .pin_bit_mask = 0,
         .mode = GPIO_MODE_OUTPUT,
@@ -468,41 +798,27 @@ bool turret_init(const turret_pins_t *pins, const turret_cfg_t *cfg)
         .pull_up_en = 0,
         .intr_type = GPIO_INTR_DISABLE
     };
-
     out.pin_bit_mask |= (1ULL << s_pins.step_gpio);
     out.pin_bit_mask |= (1ULL << s_pins.dir_gpio);
     if (s_pins.en_gpio >= 0) out.pin_bit_mask |= (1ULL << s_pins.en_gpio);
-
     ESP_ERROR_CHECK(gpio_config(&out));
     gpio_set_level((gpio_num_t)s_pins.step_gpio, 0);
     gpio_set_level((gpio_num_t)s_pins.dir_gpio, 0);
 
-    // enable activo LOW (DRV8825 típico)
+    // enable (si existe): típico DRV8825 activo LOW
     if (s_pins.en_gpio >= 0) {
         gpio_set_level((gpio_num_t)s_pins.en_gpio, 0);
     }
 
-    // -----------------------
-    // MOSFET output
-    // -----------------------
+    // MOSFET (GPIO4) salida
     if (s_pins.mosfet_gpio >= 0) {
         gpio_reset_pin((gpio_num_t)s_pins.mosfet_gpio);
         gpio_set_direction((gpio_num_t)s_pins.mosfet_gpio, GPIO_MODE_OUTPUT);
-        gpio_set_level((gpio_num_t)s_pins.mosfet_gpio, 0); // OFF por defecto
-        gpio_set_drive_capability((gpio_num_t)s_pins.mosfet_gpio, GPIO_DRIVE_CAP_3);
+        gpio_set_level((gpio_num_t)s_pins.mosfet_gpio, 0);
     }
+    mosfet_stop();
 
-    // -----------------------
-    // Microstepping pins (si existen)
-    // -----------------------
-    if (s_pins.m0_gpio >= 0) gpio_set_direction((gpio_num_t)s_pins.m0_gpio, GPIO_MODE_OUTPUT);
-    if (s_pins.m1_gpio >= 0) gpio_set_direction((gpio_num_t)s_pins.m1_gpio, GPIO_MODE_OUTPUT);
-    if (s_pins.m2_gpio >= 0) gpio_set_direction((gpio_num_t)s_pins.m2_gpio, GPIO_MODE_OUTPUT);
-
-    // -----------------------
-    // Endstops: INPUT + PULLDOWN
-    // (NO a 3V3 => presionado = 1)
-    // -----------------------
+    // endstops input
     gpio_config_t in = {
         .pin_bit_mask = 0,
         .mode = GPIO_MODE_INPUT,
@@ -510,48 +826,71 @@ bool turret_init(const turret_pins_t *pins, const turret_cfg_t *cfg)
         .pull_down_en = 1,
         .intr_type = GPIO_INTR_DISABLE
     };
-
     if (s_pins.limit_left_gpio >= 0)  in.pin_bit_mask |= (1ULL << s_pins.limit_left_gpio);
     if (s_pins.limit_right_gpio >= 0) in.pin_bit_mask |= (1ULL << s_pins.limit_right_gpio);
+    if (in.pin_bit_mask) ESP_ERROR_CHECK(gpio_config(&in));
 
-    if (in.pin_bit_mask) {
-        ESP_ERROR_CHECK(gpio_config(&in));
-    }
-
-    // -----------------------
-    // Servo init
-    // -----------------------
+    // servo
     if (!servo_init(s_pins.servo_gpio)) {
         ESP_LOGE(TAG, "servo init failed");
         return false;
     }
+    servo_set_deg(s_cfg.servo_center_deg);
 
-    s_servo_deg = s_cfg.servo_center_deg;
-    servo_set_deg(s_servo_deg);
+    // reset state
+    s_state = TSTATE_HOMING_FIND_FIRST;
+    s_scan_dir = +1;
+    s_pos_steps = 0;
 
-    ESP_LOGI(TAG, "turret init ok (step=%d dir=%d servo=%d L=%d R=%d mosfet=%d)",
-             s_pins.step_gpio, s_pins.dir_gpio, s_pins.servo_gpio,
-             s_pins.limit_left_gpio, s_pins.limit_right_gpio, s_pins.mosfet_gpio);
+    s_range_steps = 0;
+    s_steps_from_first = 0;
+    s_first_is_left = -1;
 
+    s_search_step_size = 0;
+    s_search_remaining = 0;
+    s_search_servo_phase = 0;
+
+    s_confirm_hits = 0;
+    s_confirm_start_ms = 0;
+
+    s_hold_until_ms = 0;
+    s_block_left_until_ms = 0;
+    s_block_right_until_ms = 0;
+
+    s_last_seen_ms = 0;
+    s_track_lost_since = 0;
+
+    s_homing_done = false;
+
+    ESP_LOGI(TAG, "turret init OK");
     return true;
 }
 
 void turret_start(void)
 {
+    // ✅ evita doble task
     if (s_running) return;
     s_running = true;
 
     if (!s_task) {
-        xTaskCreatePinnedToCore(turret_task, "turret_task", 4096, NULL, 6, &s_task, 1);
+        xTaskCreatePinnedToCore(
+            turret_task,
+            "turret_task",
+            8192,
+            NULL,
+            4,
+            &s_task,
+            1
+        );
     }
 }
 
 void turret_stop(void)
 {
     s_running = false;
+    mosfet_stop();
 }
 
-// Ajuste de frame size real desde video server
 void turret_set_frame_size(int w, int h)
 {
     if (w > 0) s_frame_w = w;
@@ -562,36 +901,4 @@ void turret_get_frame_size(int *w, int *h)
 {
     if (w) *w = s_frame_w;
     if (h) *h = s_frame_h;
-}
-
-// MOSFET control
-void turret_mosfet_set(bool on)
-{
-    if (s_pins.mosfet_gpio < 0) return;
-    gpio_set_level((gpio_num_t)s_pins.mosfet_gpio, on ? 1 : 0);
-}
-
-/**
- * API alternativa (si la usas desde otro lado):
- * nx, ny son normalizados 0..1
- */
-void turret_update_target(bool has_target, float nx, float ny)
-{
-    const float cx = 0.5f;
-    const float cy = 0.5f;
-    const float center_tol = 0.02f;
-
-    if (!has_target) {
-        turret_mosfet_set(false);
-        return;
-    }
-
-    float ex = nx - cx;
-    float ey = ny - cy;
-
-    float ax = fabsf(ex);
-    float ay = fabsf(ey);
-
-    bool centered = (ax < center_tol) && (ay < center_tol);
-    turret_mosfet_set(centered);
 }

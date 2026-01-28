@@ -13,8 +13,8 @@ end
 
 # Load bootloader symbols
 set confirm off
-    add-symbol-file C:/Users/j3cam/Documents/DIMECA_TORRETA/build/bootloader/bootloader.elf
+    add-symbol-file C:/Users/j3cam/Documents/DIMECA_TORRETA/DIMECA_TORRETA/build/bootloader/bootloader.elf
 set confirm on
 
 # Load application symbols
-file C:/Users/j3cam/Documents/DIMECA_TORRETA/build/simple_video_server.elf
+file C:/Users/j3cam/Documents/DIMECA_TORRETA/DIMECA_TORRETA/build/simple_video_server.elf

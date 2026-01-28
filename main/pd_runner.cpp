@@ -107,6 +107,14 @@ static void pd_task(void *arg)
     (void)arg;
 
     pd_job_t job;
+
+    // throttling de logs
+    const uint32_t LOG_EVERY_MS = 500;   // log base 2 veces por segundo
+    const uint32_t VERBOSE_EVERY_MS = 2500; // detalles completos cada 2.5s (opcional)
+
+    uint32_t last_log_ms = 0;
+    uint32_t last_verbose_ms = 0;
+
     while (true) {
         if (xQueueReceive(s_q, &job, portMAX_DELAY) != pdTRUE) {
             continue;
@@ -130,11 +138,11 @@ static void pd_task(void *arg)
         int64_t t1 = esp_timer_get_time();
 
         uint32_t infer_ms = (uint32_t)((t1 - t0) / 1000);
-        uint32_t now_ms   = (uint32_t)(esp_timer_get_time() / 1000ULL); // timestamp real
+        uint32_t now_ms   = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
         pd_result_t out = {};
         out.frame_id = job.frame_id;
-        out.ts_ms = now_ms; // <- ahora es timestamp real (ms)
+        out.ts_ms = now_ms;
 
         int n = 0;
         for (auto &r : results) {
@@ -159,13 +167,17 @@ static void pd_task(void *arg)
         s_last = out;
         xSemaphoreGive(s_mutex);
 
-        // Log base
-        ESP_LOGI(TAG, "detected=%d frame=%" PRIu32 " infer=%" PRIu32 "ms ts=%" PRIu32 "ms",
-                 out.count, out.frame_id, infer_ms, out.ts_ms);
+        // ---------------- LOGS CONTROLADOS ----------------
+        if ((now_ms - last_log_ms) >= LOG_EVERY_MS) {
+            last_log_ms = now_ms;
+            ESP_LOGI(TAG, "detected=%d frame=%" PRIu32 " infer=%" PRIu32 "ms ts=%" PRIu32 "ms",
+                     out.count, out.frame_id, infer_ms, out.ts_ms);
+        }
 
-        // ✅ Log de coordenadas + centro + normalizado (0..1)
-        if (out.count > 0) {
-            // Escoger el box "principal": el de mayor área
+        // Solo si hay detección, saca el BEST box pero NO spamees todo
+        if (out.count > 0 && (now_ms - last_verbose_ms) >= VERBOSE_EVERY_MS) {
+            last_verbose_ms = now_ms;
+
             int best = 0;
             int best_area = out.boxes[0].w * out.boxes[0].h;
             for (int i = 1; i < out.count; i++) {
@@ -181,23 +193,18 @@ static void pd_task(void *arg)
             float ny = (float)cy / (float)job.h;
 
             ESP_LOGI(TAG,
-                     "BEST box: x=%d y=%d w=%d h=%d score=%.2f | center=(%d,%d) | norm=(%.3f, %.3f) | img=%dx%d",
+                     "BEST: x=%d y=%d w=%d h=%d s=%.2f | c=(%d,%d) | n=(%.3f,%.3f) | img=%dx%d",
                      b.x, b.y, b.w, b.h, b.score, cx, cy, nx, ny, job.w, job.h);
-
-            // Si quieres ver TODOS:
-            for (int i = 0; i < out.count; i++) {
-                pd_box_t bi = out.boxes[i];
-                int cxi = bi.x + bi.w / 2;
-                int cyi = bi.y + bi.h / 2;
-                ESP_LOGI(TAG, "BOX[%d] x=%d y=%d w=%d h=%d score=%.2f center=(%d,%d)",
-                         i, bi.x, bi.y, bi.w, bi.h, bi.score, cxi, cyi);
-            }
         }
+        // --------------------------------------------------
 
-        // IMPORTANTE: liberar buffer del pool SOLO después de terminar inferencia
         pool_release(job.buf_idx);
+
+        // ✅ cede CPU para que WiFi/HTTP no se mueran
+        vTaskDelay(1);
     }
 }
+
 
 bool pd_init(void)
 {

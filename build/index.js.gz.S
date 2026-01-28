@@ -1,4 +1,4 @@
-/* * Data converted from C:/Users/j3cam/Documents/DIMECA_TORRETA/frontend/gzipped/assets/index.js.gz
+/* * Data converted from C:/Users/j3cam/Documents/DIMECA_TORRETA/DIMECA_TORRETA/frontend/gzipped/assets/index.js.gz
  * (null byte appended)
  */
 .data

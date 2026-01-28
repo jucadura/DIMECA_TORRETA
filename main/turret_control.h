@@ -19,8 +19,8 @@ typedef struct {
 
     int limit_left_gpio;      // -1 si no se usa
     int limit_right_gpio;     // -1 si no se usa
-    int mosfet_gpio;   // GPIO para activar MOSFET (ej: 4)
 
+    int mosfet_gpio;          // GPIO para activar MOSFET (ej: 4)
 } turret_pins_t;
 
 typedef struct {
@@ -28,7 +28,7 @@ typedef struct {
     uint32_t step_delay_us;
 
     // Scan
-    int32_t  scan_limit_steps;
+    int32_t  scan_limit_steps;      // (si no lo usas, pon 0)
     int32_t  scan_steps_per_tick;
     uint32_t scan_tick_ms;
 
@@ -49,19 +49,22 @@ typedef struct {
 } turret_cfg_t;
 
 bool turret_init(const turret_pins_t *pins, const turret_cfg_t *cfg);
+
 void turret_start(void);
 void turret_stop(void);
 
-// ✅ NUEVO: para que el turret sepa la resolución real del stream
-void turret_set_frame_size(int w, int h);
+/** Fuerza a re-hacer homing desde cero */
+void turret_home(void);
 
-// (opcional)
+// Frame size real del stream
+void turret_set_frame_size(int w, int h);
 void turret_get_frame_size(int *w, int *h);
+
+void turret_mosfet_set(bool on);
+
+// (Opcional, si lo estás usando desde otro lado)
+void turret_update_target(bool has_target, float nx, float ny);
 
 #ifdef __cplusplus
 }
 #endif
-
-void turret_home(void);
-void turret_mosfet_set(bool on);
-void turret_update_target(bool has_target, float nx, float ny);

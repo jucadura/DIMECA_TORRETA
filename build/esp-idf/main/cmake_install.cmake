@@ -1,4 +1,4 @@
-# Install script for directory: C:/Users/j3cam/Documents/DIMECA_TORRETA/main
+# Install script for directory: C:/Users/j3cam/Documents/DIMECA_TORRETA/DIMECA_TORRETA/main
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

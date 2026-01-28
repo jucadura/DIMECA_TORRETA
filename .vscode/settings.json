@@ -1,4 +1,7 @@
 {
     "idf.flashType": "UART",
-    "idf.portWin": "COM8"
+    "idf.portWin": "COM8",
+    "idf.espIdfPathWin": "C:\\Users\\j3cam\\esp\\v5.4.3\\esp-idf",
+    "idf.toolsPathWin": "C:\\Users\\j3cam\\.espressif",
+    "idf.pythonInstallPath": "C:\\Users\\j3cam\\.espressif\\tools\\idf-python\\3.11.2\\python.exe"
 }
